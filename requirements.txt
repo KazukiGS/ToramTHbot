@@ -1,3 +1,5 @@
 discord.py==2.4.0
 Flask==3.0.3
 requests==2.32.3
+# หมายเหตุ: ฟีเจอร์ !scan เรียก Gemini API ผ่าน REST โดยตรงด้วย requests
+# จึงไม่จำเป็นต้องติดตั้ง google-generativeai SDK เพิ่มเติม
