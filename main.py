@@ -45,6 +45,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 #   - gemini-3.1-flash-lite  (ประหยัดสุด เหมาะงานปริมาณมากๆ)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
+# โมเดลที่ใช้สำหรับคำสั่ง !Beater (แชทคุยทั่วไป) แยกจากโมเดล OCR ด้านบน
+# จะได้ปรับเปลี่ยนได้อิสระ เช่น ใช้โมเดลที่ฉลาดกว่าสำหรับแชท แต่ใช้โมเดลถูกกว่าสำหรับ OCR
+GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite")
+
+# จำนวนชั้นสูงสุดที่จะไล่เก็บสาย reply ย้อนหลัง (กันไม่ให้ยาวเกินไปจน Gemini รับไม่ไหว)
+GEMINI_CHAT_MAX_REPLY_DEPTH = 10
+
 # คำนำหน้าคำสั่งบอท (Prefix)
 COMMAND_PREFIX = "!"
 
@@ -240,7 +247,7 @@ async def add_buff_house_error(ctx, error):
 # จะถูกจับคู่และทำงานตามปกติ ไม่มาเข้า error handler นี้
 
 # รายชื่อคำสั่งที่ "ห้าม" ตีความเป็นการค้นหาไอเทม (กันชนกับคำสั่งระบบ/คำสั่งอื่นในอนาคต)
-RESERVED_COMMAND_NAMES = {"บัฟบ้าน", "เพิ่มบัฟ", "scan", "help"}
+RESERVED_COMMAND_NAMES = {"บัฟบ้าน", "เพิ่มบัฟ", "scan", "help", "beater", "Beater"}
 
 
 async def search_items_by_type(ctx, type_keyword: str):
@@ -635,6 +642,157 @@ async def scan_item(ctx):
         f"🔍 อ่านข้อมูลจากภาพได้ดังนี้ กรุณาตรวจสอบก่อนบันทึก:\n{build_preview_text(ocr_data)}",
         view=view,
     )
+
+
+# ==========================================================
+# 📌 คำสั่งที่ 5: !Beater <ข้อความ> (คุยกับ Gemini แบบมี context)
+# ==========================================================
+# ใช้งานได้ 2 แบบ:
+#   1. !Beater <ข้อความ>  -> ถามใหม่ ไม่มี context ก่อนหน้า
+#   2. Reply ไปที่ข้อความใดๆ แล้วพิมพ์ !Beater <ข้อความ> ต่อ
+#      -> บอทจะไล่เก็บ "สายการ reply" ย้อนขึ้นไปสูงสุด GEMINI_CHAT_MAX_REPLY_DEPTH ชั้น
+#      -> ประกอบเป็นบทสนทนาแล้วส่งให้ Gemini เพื่อให้เข้าใจบริบทก่อนหน้า
+# รองรับการแนบรูปได้ทั้งในข้อความปัจจุบันและข้อความที่ถูก reply ในสายการคุย
+#
+# หมายเหตุ: ไม่มีการเก็บ context ไว้ถาวร ทุกอย่างอ่านจากสาย reply ของ Discord สดๆ ทุกครั้ง
+# ดังนั้นแม้บอทจะ restart ก็ไม่กระทบ เพราะไม่ได้พึ่งความจำใน RAM หรือฐานข้อมูลใดๆ
+
+BEATER_SYSTEM_INSTRUCTION = (
+    "คุณคือผู้ช่วย AI ชื่อ Beater ที่ตอบคำถามอย่างเป็นมิตร กระชับ และเป็นประโยชน์ "
+    "ตอบเป็นภาษาไทยเป็นหลัก เว้นแต่ผู้ใช้ถามเป็นภาษาอื่น"
+)
+
+
+async def build_gemini_chat_history(message: discord.Message) -> list:
+    """
+    ไล่เก็บสาย reply ย้อนหลังจากข้อความปัจจุบัน (message) ขึ้นไปสูงสุด
+    GEMINI_CHAT_MAX_REPLY_DEPTH ชั้น แล้วแปลงเป็น "contents" รูปแบบที่ Gemini API ต้องการ
+    โดยเรียงจากเก่าสุด -> ใหม่สุด (ให้ Gemini อ่านลำดับเวลาถูกต้อง)
+
+    แต่ละข้อความจะถูกแปลงเป็น role "user" หรือ "model" ตามว่าใครเป็นคนพิมพ์
+    (ข้อความจากบอทเอง = "model", ข้อความจากคนอื่น = "user")
+    รูปภาพที่แนบมาในแต่ละข้อความ (ถ้ามี) จะถูกแนบไปด้วย
+    """
+    chain = []  # เก็บ list ของ discord.Message เรียงจากใหม่ -> เก่า ก่อน แล้วค่อย reverse
+    current = message
+    depth = 0
+
+    while current is not None and depth < GEMINI_CHAT_MAX_REPLY_DEPTH:
+        chain.append(current)
+        depth += 1
+
+        # เช็คว่าข้อความนี้เป็นการ reply ไปที่ข้อความอื่นหรือไม่
+        if current.reference and current.reference.message_id:
+            try:
+                # ลองดึงจาก cache ก่อน (เร็วกว่า) ถ้าไม่มีค่อยดึงจาก Discord API
+                parent = current.reference.cached_message
+                if parent is None:
+                    parent = await current.channel.fetch_message(current.reference.message_id)
+                current = parent
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                current = None
+        else:
+            current = None
+
+    chain.reverse()  # เรียงจากเก่าสุด -> ใหม่สุด
+
+    contents = []
+    for msg in chain:
+        role = "model" if msg.author.id == bot.user.id else "user"
+        parts = []
+
+        # ข้อความ (ตัด prefix คำสั่ง !Beater ออกถ้ามี เพื่อไม่ให้ปนไปกับเนื้อหาจริง)
+        text = msg.content
+        if text.lower().startswith(f"{COMMAND_PREFIX}beater"):
+            text = text[len(COMMAND_PREFIX) + len("beater"):].strip()
+
+        if text:
+            parts.append({"text": text})
+
+        # แนบรูปภาพ (ถ้ามี) ในข้อความนี้
+        for attachment in msg.attachments:
+            if attachment.content_type and attachment.content_type.startswith("image/"):
+                try:
+                    img_bytes = await attachment.read()
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": attachment.content_type,
+                            "data": base64.b64encode(img_bytes).decode("utf-8"),
+                        }
+                    })
+                except discord.HTTPException:
+                    pass  # ถ้าดึงรูปไม่สำเร็จ ข้ามไปเฉยๆ ไม่ให้ทั้งคำสั่งพัง
+
+        if parts:
+            contents.append({"role": role, "parts": parts})
+
+    return contents
+
+
+def call_gemini_chat(contents: list) -> str:
+    """
+    ส่ง conversation history (contents) ไปให้ Gemini แล้วคืนค่าเป็นข้อความตอบกลับ (string)
+    ต่างจาก _call_gemini_generate ตรงที่ตัวนี้ไม่บังคับ JSON response (เพราะเป็นแชทคุยทั่วไป)
+    """
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_CHAT_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    body = {
+        "contents": contents,
+        "systemInstruction": {"parts": [{"text": BEATER_SYSTEM_INSTRUCTION}]},
+    }
+
+    resp = requests.post(url, json=body, timeout=60)
+    resp.raise_for_status()
+    result = resp.json()
+
+    candidates = result.get("candidates", [])
+    if not candidates:
+        # กรณีถูก block โดย safety filter หรือไม่มีคำตอบ
+        finish_reason = result.get("promptFeedback", {}).get("blockReason", "ไม่ทราบสาเหตุ")
+        return f"⚠️ Gemini ไม่สามารถตอบคำถามนี้ได้ (เหตุผล: {finish_reason})"
+
+    text_parts = [p.get("text", "") for p in candidates[0]["content"]["parts"] if "text" in p]
+    return "".join(text_parts) if text_parts else "⚠️ Gemini ไม่ได้ส่งข้อความตอบกลับมา"
+
+
+@bot.command(name="Beater", aliases=["beater"])
+async def beater_chat(ctx, *, user_message: str = None):
+    # ต้องมีข้อความ หรือมีรูปแนบมาอย่างน้อย 1 อย่าง
+    if not user_message and not ctx.message.attachments:
+        await ctx.send(
+            "⚠️ กรุณาพิมพ์ข้อความหรือแนบรูปมาด้วย เช่น `!Beater สวัสดี` "
+            "หรือ reply ข้อความเดิมแล้วพิมพ์ `!Beater <คำถามต่อเนื่อง>`"
+        )
+        return
+
+    async with ctx.typing():
+        try:
+            contents = await build_gemini_chat_history(ctx.message)
+            if not contents:
+                await ctx.send("⚠️ ไม่พบข้อความที่จะส่งให้ Gemini กรุณาลองใหม่อีกครั้ง")
+                return
+
+            reply_text = call_gemini_chat(contents)
+        except requests.exceptions.RequestException as ex:
+            await ctx.send(f"❌ เชื่อมต่อ Gemini API ไม่สำเร็จ: `{ex}`")
+            return
+        except (KeyError, IndexError) as ex:
+            await ctx.send(f"❌ ไม่สามารถอ่านผลลัพธ์จาก Gemini ได้: `{ex}`")
+            return
+
+        # Discord จำกัดความยาวข้อความที่ 2000 ตัวอักษร ถ้ายาวเกินให้ตัดส่งเป็นหลายข้อความ
+        if len(reply_text) <= 2000:
+            await ctx.reply(reply_text)
+        else:
+            chunks = [reply_text[i:i + 1900] for i in range(0, len(reply_text), 1900)]
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    await ctx.reply(chunk)
+                else:
+                    await ctx.send(chunk)
 
 
 # ==========================================================
