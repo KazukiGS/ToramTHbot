@@ -227,7 +227,112 @@ async def add_buff_house_error(ctx, error):
 
 
 # ==========================================================
-# 📌 คำสั่งที่ 3: !scan (แนบรูปมาพร้อมคำสั่ง)
+# 📌 คำสั่งที่ 3: ค้นหาไอเทมตามประเภท แบบไดนามิก
+# ==========================================================
+# ต่างจาก !บัฟบ้าน ตรงที่ "ชื่อคำสั่ง" คือคำค้นหาประเภทอาวุธเอง เช่น:
+#   !คาตานะ   -> ค้นหาไอเทมที่ Type มีคำว่า "คาตานะ"
+#   !ดาบ      -> ค้นหาไอเทมที่ Type มีคำว่า "ดาบ"
+# ไม่ต้องแก้โค้ดเพิ่มเวลามีประเภทอาวุธใหม่ในเกม
+#
+# วิธีทำ: ใช้ on_command_error ดัก CommandNotFound (คือกรณีที่พิมพ์ !xxx
+# แต่ไม่มีคำสั่งชื่อ xxx registered ไว้จริง) แล้วเอาคำว่า xxx ไปค้นหาใน Sheet2 แทน
+# วิธีนี้ไม่ชนกับคำสั่งที่มีอยู่แล้ว (บัฟบ้าน, เพิ่มบัฟ, scan) เพราะคำสั่งเหล่านั้น
+# จะถูกจับคู่และทำงานตามปกติ ไม่มาเข้า error handler นี้
+
+# รายชื่อคำสั่งที่ "ห้าม" ตีความเป็นการค้นหาไอเทม (กันชนกับคำสั่งระบบ/คำสั่งอื่นในอนาคต)
+RESERVED_COMMAND_NAMES = {"บัฟบ้าน", "เพิ่มบัฟ", "scan", "help"}
+
+
+async def search_items_by_type(ctx, type_keyword: str):
+    """
+    ค้นหาไอเทมทั้งหมดใน Sheet2 (Items) ที่คอลัมน์ Type มีคำว่า type_keyword
+    (ไม่สนตัวพิมพ์เล็ก-ใหญ่) แล้วแสดงผลแบบละเอียด (ชื่อ/ประเภท/BaseATK/ATK Range/Stability/สเตตัส)
+    """
+    async with ctx.typing():
+        try:
+            response = requests.get(APPS_SCRIPT_URL, params={"sheet": "items"}, timeout=15)
+            response.raise_for_status()
+            result = response.json()
+        except requests.exceptions.RequestException as ex:
+            await ctx.send(f"❌ เกิดข้อผิดพลาดในการเชื่อมต่อฐานข้อมูล: `{ex}`")
+            return
+        except ValueError:
+            await ctx.send("❌ ไม่สามารถอ่านข้อมูลที่ได้รับจากฐานข้อมูล (รูปแบบ JSON ไม่ถูกต้อง)")
+            return
+
+        if result.get("status") != "success":
+            await ctx.send(f"❌ ฐานข้อมูลตอบกลับข้อผิดพลาด: `{result.get('message')}`")
+            return
+
+        all_items = result.get("data", [])
+
+        # ค้นหาแบบไม่สนตัวพิมพ์เล็ก-ใหญ่ จากคอลัมน์ Type
+        keyword = type_keyword.strip().lower()
+        matched = [item for item in all_items if keyword in str(item.get("type", "")).lower()]
+
+        if not matched:
+            await ctx.send(f"🔍 ไม่พบไอเทมประเภท `{type_keyword}` ในระบบ")
+            return
+
+        # แสดงผลแบบละเอียดทีละรายการ (ชื่อ/ประเภท/BaseATK/ATK Range/Stability/สเตตัส)
+        await ctx.send(f"📋 พบไอเทมประเภท **{type_keyword}** จำนวน {len(matched)} รายการ")
+
+        # ส่งทีละรายการเป็น code block เพื่อให้อ่านง่าย (กันข้อความยาวเกิน 2000 ตัวอักษร)
+        current_chunk = ""
+        for item in matched:
+            stats_raw = str(item.get("stats", "-"))
+            stats_lines = [s.strip() for s in stats_raw.split(",") if s.strip()] if stats_raw != "-" else []
+            stats_display = "\n".join(f"  • {s}" for s in stats_lines) if stats_lines else "  -"
+
+            block = (
+                f"```\n"
+                f"ชื่อไอเทม : {item.get('itemName', '-')}\n"
+                f"ประเภท    : {item.get('type', '-')}\n"
+                f"BaseATK   : {item.get('baseAtk', '-')}\n"
+                f"ATK Range : {item.get('atkRange', '-')}\n"
+                f"Stability : {item.get('stability', '-')}\n"
+                f"สเตตัส:\n{stats_display}\n"
+                f"```"
+            )
+
+            # ถ้ารวมเข้าไปแล้วเกิน 1900 ตัวอักษร ให้ส่งชุดปัจจุบันก่อนแล้วเริ่มชุดใหม่
+            if len(current_chunk) + len(block) > 1900:
+                await ctx.send(current_chunk)
+                current_chunk = block
+            else:
+                current_chunk += block
+
+        if current_chunk:
+            await ctx.send(current_chunk)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    """
+    ดักจับ error ทุกชนิดที่เกิดจากคำสั่งบอท
+    กรณีสำคัญ: CommandNotFound -> หมายความว่าผู้ใช้พิมพ์ !xxx ที่ไม่ใช่คำสั่งระบบ
+    ให้ตีความ xxx เป็นคำค้นหาประเภทไอเทมโดยอัตโนมัติ (ฟีเจอร์ค้นหาไดนามิก)
+    """
+    if isinstance(error, commands.CommandNotFound):
+        # ตัดคำนำหน้า prefix (!) ออก แล้วแยกเอาเฉพาะชื่อคำสั่ง (คำแรก) มาเป็นคำค้นหา
+        raw_content = ctx.message.content[len(COMMAND_PREFIX):]
+        type_keyword = raw_content.split()[0] if raw_content.split() else ""
+
+        if not type_keyword or type_keyword in RESERVED_COMMAND_NAMES:
+            return  # ไม่มีอะไรให้ค้น หรือชนกับชื่อคำสั่งที่กันไว้ -> เงียบไว้ ไม่ต้องตอบ
+
+        await search_items_by_type(ctx, type_keyword)
+        return
+
+    # error ชนิดอื่นๆ ที่ไม่ใช่ CommandNotFound (เช่น permission error ของคำสั่งอื่น)
+    # จะถูกจัดการโดย error handler เฉพาะของคำสั่งนั้นๆ อยู่แล้ว (เช่น add_buff_house_error)
+    # ตรงนี้แค่กันเคส error ที่ไม่มีใครจัดการ ไม่ให้บอท crash เงียบๆ
+    if not hasattr(ctx.command, "on_error"):
+        print(f"⚠️ Unhandled command error: {error}")
+
+
+# ==========================================================
+# 📌 คำสั่งที่ 4: !scan (แนบรูปมาพร้อมคำสั่ง)
 # ==========================================================
 # ผู้ใช้พิมพ์ !scan แล้วแนบภาพหน้าจอไอเทมในเกมมาด้วย
 # บอทจะส่งภาพไปให้ Gemini อ่าน (OCR) แล้วดึงข้อมูลตามโครงสร้างที่กำหนด
